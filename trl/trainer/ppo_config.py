@@ -14,6 +14,7 @@
 
 import os
 from dataclasses import dataclass, field
+from re import search
 from typing import Literal, Optional
 
 from ..trainer.utils import OnPolicyConfig
@@ -74,11 +75,15 @@ class PPOConfig(OnPolicyConfig):
     )
     model_adapter_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Name of the train target PEFT adapter, when using LoRA with multiple adapters."},
+        metadata={
+            "help": "Name of the train target PEFT adapter, when using LoRA with multiple adapters."
+        },
     )
     ref_adapter_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."},
+        metadata={
+            "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
+        },
     )
     num_ppo_epochs: int = field(
         default=4,
@@ -116,6 +121,47 @@ class PPOConfig(OnPolicyConfig):
     gamma: float = field(
         default=1.0,
         metadata={"help": "Discount factor."},
+    )
+    rounds: int = field(
+        default=2,
+        metadata={"help": "rollout rounds"},
+    )
+    use_vm: bool = field(
+        default=True,
+        metadata={"help": "use value model to estimate the returns of the new papers"},
+    )
+    use_selector: bool = field(
+        default=True, metadata={"help": "use selector to select the papers"}
+    )
+    paper_db: str = field(default="", metadata={"help": "path to the paper database"})
+    paper_id: str = field(
+        default="", metadata={"help": "paper id to paper title mapping"}
+    )
+    search_select_score: float = field(
+        default=0.5, metadata={"help": "the score to select the papers during search"}
+    )
+    expand_select_score: float = field(
+        default=0.5, metadata={"help": "the score to select the papers during expand"}
+    )
+    search_cost: float = field(
+        default=0.2, metadata={"help": "the cost to excute the search operation"}
+    )
+    expand_cost: float = field(
+        default=0.2, metadata={"help": "the cost to excute the expand operation"}
+    )
+    max_papers: int = field(
+        default=5, metadata={"help": "the max number of papers in the paper list"}
+    )
+    value_step: int = field(
+        default=5, metadata={"help": "the number of steps to update the value model"}
+    )
+    value_max_length: int = field(
+        default=992,
+        metadata={"help": "the max length of the value model input to avoid OOM"},
+    )
+    warm_up_step: int = field(
+        default=50,
+        metadata={"help": "the number of steps to warm up the value model"},
     )
     lam: float = field(
         default=0.95,

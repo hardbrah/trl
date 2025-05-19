@@ -13,15 +13,17 @@
 # limitations under the License.
 
 import shutil
+from typing import override, Optional
 
 import torch
 from accelerate import PartialState
-from datasets import load_dataset
+from custom_agent.agent_dataset import AgentDataset
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     HfArgumentParser,
+    Trainer,
 )
 
 from trl import (
@@ -34,6 +36,7 @@ from trl import (
     get_quantization_config,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+import torch.nn as nn
 
 
 """
@@ -74,6 +77,30 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
 """
 
 
+class FixZero3CheckpointPPOTrainer(PPOTrainer):
+
+    @override
+    def save_model(
+        self, output_dir: Optional[str] = None, _internal_call: bool = False
+    ):
+        backup_model = self.model
+        self.model = self.model.policy
+
+        Trainer.save_model(output_dir, _internal_call)
+
+        self.model = backup_model
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        if self.is_deepspeed_enabled:
+            state_dict = {
+                name.removeprefix("policy."): param
+                for name, param in state_dict.items()
+                if name.startswith("policy.")
+            }
+
+        super()._save(output_dir, state_dict)
+
+
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
@@ -84,7 +111,9 @@ if __name__ == "__main__":
     # Model & Tokenizer
     ################
     torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+        model_args.torch_dtype
+        if model_args.torch_dtype in ["auto", None]
+        else getattr(torch, model_args.torch_dtype)
     )
     quantization_config = get_quantization_config(model_args)
     model_kwargs = dict(
@@ -96,17 +125,26 @@ if __name__ == "__main__":
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
+        model_args.model_name_or_path,
+        padding_side="left",
+        trust_remote_code=model_args.trust_remote_code,
     )
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    # tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        num_labels=1,
     )
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
-    )
+    for m in value_model.score.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0, std=0.01)
+    # reward_model = AutoModelForSequenceClassification.from_pretrained(
+    #     training_args.reward_model_path,
+    #     trust_remote_code=model_args.trust_remote_code,
+    #     num_labels=1,
+    # )
     policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
@@ -116,64 +154,89 @@ if __name__ == "__main__":
         ref_policy = AutoModelForCausalLM.from_pretrained(
             training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
         )
-    else:
+    else:  # peft
         ref_policy = None
 
     ################
     # Dataset
     ################
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    train_dataset = dataset[script_args.dataset_train_split]
-    eval_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
+    train_dataset = AgentDataset(script_args.dataset_name, tokenizer)
+    assert (
+        train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    ), "The last token should not be an EOS token"
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # train_dataset = dataset[script_args.dataset_train_split]
+    # eval_dataset = (
+    #     dataset[script_args.dataset_test_split]
+    #     if training_args.eval_strategy != "no"
+    #     else None
+    # )
 
-    def prepare_dataset(dataset, tokenizer):
-        """pre-tokenize the dataset before training; only collate during training"""
+    # def prepare_dataset(dataset, tokenizer):
+    #     """pre-tokenize the dataset before training; only collate during training"""
 
-        def tokenize(element):
-            input_ids = tokenizer.apply_chat_template(
-                element["messages"][:1],
-                padding=False,
-                add_generation_prompt=True,
-            )
-            return {"input_ids": input_ids, "lengths": len(input_ids)}
+    #     def tokenize(element):
+    #         input_ids = tokenizer.apply_chat_template(
+    #             element["messages"][:1],
+    #             padding=False,
+    #             add_generation_prompt=True,
+    #         )
+    #         return {"input_ids": input_ids, "lengths": len(input_ids)}
 
-        return dataset.map(
-            tokenize,
-            remove_columns=dataset.column_names,
-            num_proc=training_args.dataset_num_proc,
-        )
+    #     return dataset.map(
+    #         tokenize,
+    #         remove_columns=dataset.column_names,
+    #         num_proc=training_args.dataset_num_proc,
+    #     )
 
     # Compute that only on the main process for faster data processing.
     # see: https://github.com/huggingface/trl/pull/1255
-    with PartialState().local_main_process_first():
-        train_dataset = prepare_dataset(train_dataset, tokenizer)
-        if eval_dataset is not None:
-            eval_dataset = prepare_dataset(eval_dataset, tokenizer)
-        # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+    # with PartialState().local_main_process_first():
+    #     train_dataset = prepare_dataset(train_dataset, tokenizer)
+    #     if eval_dataset is not None:
+    #         eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+    #     # filtering
+    #     train_dataset = train_dataset.filter(
+    #         lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+    #     )
+    #     if eval_dataset is not None:
+    #         eval_dataset = eval_dataset.filter(
+    #             lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+    #         )
 
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
+    # assert (
+    #     train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    # ), "The last token should not be an EOS token"
     ################
     # Training
     ################
-    trainer = PPOTrainer(
+    # trainer = PPOTrainer(
+    #     args=training_args,
+    #     processing_class=tokenizer,
+    #     model=policy,
+    #     ref_model=ref_policy,
+    #     reward_model=reward_model,
+    #     value_model=value_model,
+    #     train_dataset=train_dataset,
+    #     eval_dataset=eval_dataset,
+    #     peft_config=peft_config,
+    # )
+    trainer = FixZero3CheckpointPPOTrainer(
         args=training_args,
         processing_class=tokenizer,
         model=policy,
         ref_model=ref_policy,
-        reward_model=reward_model,
         value_model=value_model,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        paper_db=training_args.paper_db,
+        paper_id=training_args.paper_id,
         peft_config=peft_config,
     )
     trainer.train()
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    # if training_args.push_to_hub:
+    #     trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
-    trainer.generate_completions()
+    # trainer.generate_completions()
