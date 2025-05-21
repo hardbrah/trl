@@ -24,6 +24,7 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
+    AutoConfig,
 )
 
 from trl import (
@@ -37,6 +38,8 @@ from trl import (
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 import torch.nn as nn
+from peft import PeftModel
+from transformers import Qwen2ForSequenceClassification, Qwen2Model
 
 
 """
@@ -101,6 +104,20 @@ class FixZero3CheckpointPPOTrainer(PPOTrainer):
         super()._save(output_dir, state_dict)
 
 
+class CustomQwen2ForSequenceClassification(Qwen2ForSequenceClassification):
+    def __init__(self, lora_path, config) -> None:
+        super().__init__(config)
+        self.num_labels = 1
+        model = Qwen2Model(config)
+        self.model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
+        self.score = nn.Sequential(
+            nn.Linear(config.hidden_size, 384, bias=False),
+            nn.Linear(384, num_labels, bias=False),
+        )
+
+        self.post_init()
+
+
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
@@ -110,52 +127,93 @@ if __name__ == "__main__":
     ################
     # Model & Tokenizer
     ################
-    torch_dtype = (
-        model_args.torch_dtype
-        if model_args.torch_dtype in ["auto", None]
-        else getattr(torch, model_args.torch_dtype)
-    )
-    quantization_config = get_quantization_config(model_args)
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        attn_implementation=model_args.attn_implementation,
-        torch_dtype=torch_dtype,
-        device_map=get_kbit_device_map() if quantization_config is not None else None,
-        quantization_config=quantization_config,
-    )
+    # torch_dtype = (
+    #     model_args.torch_dtype
+    #     if model_args.torch_dtype in ["auto", None]
+    #     else getattr(torch, model_args.torch_dtype)
+    # )
+    # quantization_config = get_quantization_config(model_args)
+    # model_kwargs = dict(
+    #     revision=model_args.model_revision,
+    #     attn_implementation=model_args.attn_implementation,
+    #     torch_dtype=torch_dtype,
+    #     device_map=get_kbit_device_map() if quantization_config is not None else None,
+    #     quantization_config=quantization_config,
+    # )
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         padding_side="left",
         trust_remote_code=model_args.trust_remote_code,
+        max_length=1024,
     )
     # tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    if tokenizer.chat_template is None:
-        tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
-    value_model = AutoModelForSequenceClassification.from_pretrained(
+    # if tokenizer.chat_template is None:
+    #     tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
+    # value_model = AutoModelForSequenceClassification.from_pretrained(
+    #     training_args.reward_model_path,
+    #     trust_remote_code=model_args.trust_remote_code,
+    #     num_labels=1,
+    # )
+    # for m in value_model.score.modules():
+    #     if isinstance(m, nn.Linear):
+    #         nn.init.normal_(m.weight, mean=0, std=0.01)
+    config = AutoConfig.from_pretrained(
         training_args.reward_model_path,
-        trust_remote_code=model_args.trust_remote_code,
         num_labels=1,
+        trust_remote_code=model_args.trust_remote_code,
     )
+    value_model = CustomQwen2ForSequenceClassification(
+        lora_path=training_args.lora_path, config=config
+    )
+    # 给score层初始化
     for m in value_model.score.modules():
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, mean=0, std=0.01)
+
     # reward_model = AutoModelForSequenceClassification.from_pretrained(
     #     training_args.reward_model_path,
     #     trust_remote_code=model_args.trust_remote_code,
     #     num_labels=1,
     # )
-    policy = AutoModelForCausalLM.from_pretrained(
+    policy_base = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
+    policy = PeftModel.from_pretrained(
+        policy_base,
+        adapter_name=training_args.model_adapter_name,
+        torch_dtype=torch.bfloat16,
+        model_id=training_args.lora_path,
+        lora_dropout=0.05,
+        is_trainable=True,
+    )
 
-    peft_config = get_peft_config(model_args)
-    if peft_config is None:
-        ref_policy = AutoModelForCausalLM.from_pretrained(
-            training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
-        )
-    else:  # peft
-        ref_policy = None
+    # 设置 ref_policy 为None， 只加载其LoRA Adapter
+    ref_policy = None
+    policy.load_adapter(
+        training_args.lora_path,
+        adapter_name=training_args.ref_adapter_name,
+        is_trainable=False,
+    )
+    # ref_policy_base = AutoModelForCausalLM.from_pretrained(
+    #     training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
+    # )
+    # ref_policy = PeftModel.from_pretrained(
+    #     ref_policy_base,
+    #     adapter_name="ref_policy",
+    #     torch_dtype=torch.bfloat16,
+    #     model_id="/root/pasa/results/sft_crawler/checkpoint-3248",
+    #     is_trainable=False,
+    #     lora_dropout=0.0,
+    # )
+
+    # peft_config = get_peft_config(model_args)
+    # if peft_config is None:
+    #     ref_policy = AutoModelForCausalLM.from_pretrained(
+    #         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
+    #     )
+    # else:  # peft
+    #     ref_policy = None
 
     ################
     # Dataset
@@ -230,7 +288,7 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         paper_db=training_args.paper_db,
         paper_id=training_args.paper_id,
-        peft_config=peft_config,
+        peft_config=None,
     )
     trainer.train()
 

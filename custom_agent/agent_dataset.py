@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 from transformers import DataCollatorWithPadding
 
 prompts = {
-    "generate_query": "Please generate some matually exclusive queries in a list to search the relevant papers according to the User Query. Searching for survey papers would be better.\nUser Query: {user_query}",
+    "generate_query": "Please generate some mutually exclusive queries in a list to search the relevant papers according to the User Query. Searching for survey papers would be better.\nUser Query: {user_query}",
     "select_section": "You are conducting research on '{user_query}'. You need to predict which sections to look at for getting more relevant papers. Title: {title}\nAbstract: {abstract}\nSections: {sections}",
 }
 

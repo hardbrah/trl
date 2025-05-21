@@ -175,3 +175,16 @@ class PPOConfig(OnPolicyConfig):
             "exceed the VRAM capacity of a single GPU, albeit at the cost of slower generation."
         },
     )
+    lora_path: str = field(default="", metadata={"help": "path to the lora adapter"})
+    model_adapter_name: str = field(
+        default="default",
+        metadata={
+            "help": "Name of the train target PEFT adapter, when using LoRA with multiple adapters."
+        },
+    )
+    ref_adapter_name: str = field(
+        default="",
+        metadata={
+            "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
+        },
+    )

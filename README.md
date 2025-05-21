@@ -1,3 +1,8 @@
+- [ ] 在ppo_tldr中加载PEFT模型
+- [ ] 分别加载选择器，策略模型，参考模型，价值网络
+
+
+
 # TRL - Transformer Reinforcement Learning
 
 <div style="text-align: center">
